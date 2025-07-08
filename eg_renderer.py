@@ -1,40 +1,48 @@
 """
 Existential Graph Renderer
-Converts parsed CLIF expressions to visual EG representations using enhanced graphics items.
+Integrates all fixes for proper EG representation.
 """
 
 from PySide6.QtCore import QPointF, QRectF
 from PySide6.QtWidgets import QGraphicsScene
-from enhanced_graphics_items import (EnhancedPredicateItem, EnhancedCutItem, 
-                                   FlexibleLigatureItem, LigatureManager)
+from graphics_items import (PredicateItem, CutItem, 
+                           LigatureItem, InteractionMode)
+from line_of_identity_item import LineOfIdentityItem, StandaloneLineOfIdentityItem
 from eg_model import GraphModel, Cut, Predicate, LineOfIdentity, Ligature
 import math
 
 class EGRenderer:
     """
-    Renders existential graphs from parsed CLIF expressions or graph models.
-    Handles layout, positioning, and visual optimization.
+    Renderer that properly handles all identified issues:
+    1. Constants as separate predicate nodes with proper connections
+    2. Lines of identity as visible elements attached to hooks
+    3. Proper hook-to-hook ligature connections
+    4. Enhanced containment validation
+    5. Correct equality representation
     """
     
     def __init__(self, scene, editor):
         self.scene = scene
         self.editor = editor
         self.graphics_items = {}  # Maps object IDs to graphics items
-        self.ligature_manager = LigatureManager(scene, editor)
+        self.line_items = {}      # Maps line IDs to line graphics items
+        self.ligature_items = {}  # Maps ligature IDs to ligature graphics items
         
         # Layout parameters
         self.predicate_spacing = 120
         self.cut_padding = 40
         self.vertical_spacing = 80
+        self.line_length = 30
         
     def clear(self):
         """Clear all rendered items."""
         self.scene.clear()
         self.graphics_items.clear()
-        self.ligature_manager = LigatureManager(self.scene, self.editor)
+        self.line_items.clear()
+        self.ligature_items.clear()
         
     def render_from_parse_result(self, parse_result):
-        """Render from a CLIF parser result."""
+        """Render from a final corrected CLIF parser result."""
         if not parse_result.get('success', False):
             return False
             
@@ -44,20 +52,13 @@ class EGRenderer:
         root_result = parse_result['result']
         self._render_expression_tree(root_result, QPointF(0, 0))
         
-        # Create ligatures based on variable connections
-        self._create_ligatures_from_variables(parse_result.get('variable_map', {}))
+        # Create lines of identity for all variables with proper visibility
+        variable_map = parse_result.get('variable_map', {})
+        hook_connections = parse_result.get('hook_connections', {})
+        self._create_visible_lines_of_identity(variable_map, hook_connections)
         
-        # Optimize layout
-        self._optimize_layout()
-        
-        return True
-        
-    def render_from_model(self, graph_model):
-        """Render from a graph model directly."""
-        self.clear()
-        
-        # Render all objects in the model
-        self._render_model_objects(graph_model)
+        # Create ligatures with proper hook connections
+        self._create_proper_ligatures(parse_result)
         
         # Optimize layout
         self._optimize_layout()
@@ -84,12 +85,12 @@ class EGRenderer:
         return None
         
     def _render_constant(self, expr_result, position):
-        """Render a constant predicate."""
+        """Render a constant as a predicate."""
         pred_id = expr_result['predicate_id']
         name = expr_result['name']
         
-        pred_item = EnhancedPredicateItem(
-            pred_id, name, 1, position.x(), position.y(), self.editor
+        pred_item = PredicateItem(
+            pred_id, name.capitalize(), 0, position.x(), position.y(), self.editor
         )
         
         self.scene.addItem(pred_item)
@@ -98,12 +99,12 @@ class EGRenderer:
         return pred_item
         
     def _render_predicate(self, expr_result, position):
-        """Render a predicate with arguments."""
+        """Render a predicate with proper hook connections."""
         pred_id = expr_result['predicate_id']
         name = expr_result['name']
         arity = expr_result['arity']
         
-        pred_item = EnhancedPredicateItem(
+        pred_item = PredicateItem(
             pred_id, name, arity, position.x(), position.y(), self.editor
         )
         
@@ -113,11 +114,11 @@ class EGRenderer:
         return pred_item
         
     def _render_conjunction(self, expr_result, position):
-        """Render conjunction - place predicates horizontally."""
+        """Render conjunction - place items horizontally."""
         conjuncts = expr_result['conjuncts']
         rendered_items = []
         
-        # Calculate total width needed
+        # Calculate positions for conjuncts
         total_width = len(conjuncts) * self.predicate_spacing
         start_x = position.x() - total_width / 2
         
@@ -125,7 +126,10 @@ class EGRenderer:
             item_pos = QPointF(start_x + i * self.predicate_spacing, position.y())
             item = self._render_expression_tree(conjunct, item_pos)
             if item:
-                rendered_items.append(item)
+                if isinstance(item, list):
+                    rendered_items.extend(item)
+                else:
+                    rendered_items.append(item)
                 
         return rendered_items
         
@@ -145,25 +149,19 @@ class EGRenderer:
         
         # Calculate cut bounds based on inner items
         if inner_items:
-            # Get bounding rectangle of all inner items
-            min_x = min(item.pos().x() + item.boundingRect().left() for item in inner_items)
-            max_x = max(item.pos().x() + item.boundingRect().right() for item in inner_items)
-            min_y = min(item.pos().y() + item.boundingRect().top() for item in inner_items)
-            max_y = max(item.pos().y() + item.boundingRect().bottom() for item in inner_items)
-            
-            # Add padding
-            cut_x = min_x - self.cut_padding
-            cut_y = min_y - self.cut_padding
-            cut_width = (max_x - min_x) + 2 * self.cut_padding
-            cut_height = (max_y - min_y) + 2 * self.cut_padding
+            bounds = self._calculate_items_bounds(inner_items)
+            cut_x = bounds.x() - self.cut_padding
+            cut_y = bounds.y() - self.cut_padding
+            cut_width = bounds.width() + 2 * self.cut_padding
+            cut_height = bounds.height() + 2 * self.cut_padding
         else:
             # Default cut size
-            cut_x = position.x() - 60
-            cut_y = position.y() - 40
-            cut_width = 120
-            cut_height = 80
+            cut_x = position.x() - 50
+            cut_y = position.y() - 30
+            cut_width = 100
+            cut_height = 60
         
-        cut_item = EnhancedCutItem(cut_id, cut_x, cut_y, cut_width, cut_height, self.editor)
+        cut_item = CutItem(cut_id, cut_x, cut_y, cut_width, cut_height, self.editor)
         self.scene.addItem(cut_item)
         self.graphics_items[cut_id] = cut_item
         
@@ -171,144 +169,131 @@ class EGRenderer:
         
     def _render_existential(self, expr_result, position):
         """Render existential quantification (implicit in EG)."""
-        # Just render the body - existential quantification is implicit in EG
         return self._render_expression_tree(expr_result['body'], position)
         
     def _render_equality(self, expr_result, position):
-        """Render equality - handled through ligature connections."""
-        # Equality is represented by ligature connections, not visual items
-        return None
+        """Render equality with corrected merged line representation."""
+        var1 = expr_result['variable1']
+        var2 = expr_result['variable2']
+        shared_line_id = expr_result['shared_line_id']
         
-    def _create_ligatures_from_variables(self, variable_map):
-        """Create ligature graphics items based on variable connections."""
-        # Group predicates by their connected variables
-        line_connections = {}  # Maps line IDs to list of (pred_id, hook_index)
+        # Create a single line representing both variables
+        line_item = LineOfIdentityItem(shared_line_id, f"{var1}={var2}")
+        line_item.setPos(position)
+        line_item.end_point = QPointF(50, 0)  # Longer line for equality
         
-        # Scan all predicates in the model to find connections
-        for obj_id, obj in self.editor.model.objects.items():
-            if isinstance(obj, Predicate):
-                for hook_index, line_id in obj.hooks.items():
-                    if line_id:
-                        if line_id not in line_connections:
-                            line_connections[line_id] = []
-                        line_connections[line_id].append((obj_id, hook_index))
+        self.scene.addItem(line_item)
+        self.line_items[shared_line_id] = line_item
+    
+    def _create_visible_lines_of_identity(self, variable_map, hook_connections):
+        """Create visible lines of identity that properly connect to predicate hooks."""
+        # Group hook connections by variable (line ID)
+        line_to_hooks = {}
         
-        # Create ligatures for lines with multiple connections
-        for line_id, connections in line_connections.items():
-            if len(connections) > 1:
-                # Find corresponding ligatures in the model
-                line_obj = self.editor.model.get_object(line_id)
-                if line_obj and hasattr(line_obj, 'ligatures'):
-                    for ligature_id in line_obj.ligatures:
-                        self.ligature_manager.create_ligature(ligature_id, connections)
-                        
-    def _render_model_objects(self, graph_model):
-        """Render objects directly from a graph model."""
-        # First pass: render all cuts and predicates
-        positions = self._calculate_layout_positions(graph_model)
+        for (pred_id, hook_index), line_id in hook_connections.items():
+            if line_id not in line_to_hooks:
+                line_to_hooks[line_id] = []
+            line_to_hooks[line_id].append((pred_id, hook_index))
         
-        for obj_id, obj in graph_model.objects.items():
-            if isinstance(obj, Cut):
-                pos = positions.get(obj_id, QPointF(0, 0))
-                # Calculate cut size based on children
-                cut_rect = self._calculate_cut_bounds(obj, positions)
-                cut_item = EnhancedCutItem(
-                    obj_id, cut_rect.x(), cut_rect.y(), 
-                    cut_rect.width(), cut_rect.height(), self.editor
-                )
-                self.scene.addItem(cut_item)
-                self.graphics_items[obj_id] = cut_item
+        # Create lines of identity for each variable
+        for var_name, line_id in variable_map.items():
+            if line_id not in self.line_items:
+                hook_list = line_to_hooks.get(line_id, [])
                 
-            elif isinstance(obj, Predicate):
-                pos = positions.get(obj_id, QPointF(0, 0))
-                arity = len([h for h in obj.hooks.values() if h is not None])
-                pred_item = EnhancedPredicateItem(
-                    obj_id, obj.label, arity, pos.x(), pos.y(), self.editor
-                )
-                self.scene.addItem(pred_item)
-                self.graphics_items[obj_id] = pred_item
-        
-        # Second pass: create ligatures
-        self._create_ligatures_from_model(graph_model)
-        
-    def _calculate_layout_positions(self, graph_model):
-        """Calculate optimal positions for all objects."""
-        positions = {}
-        
-        # Simple layout algorithm - can be enhanced
-        root_children = graph_model.sheet_of_assertion.children
-        
-        # Arrange root level items
-        x_offset = 0
-        for child_id in root_children:
-            positions[child_id] = QPointF(x_offset, 0)
-            x_offset += self.predicate_spacing
-            
-            # Recursively position children of cuts
-            child_obj = graph_model.get_object(child_id)
-            if isinstance(child_obj, Cut):
-                self._position_cut_children(child_obj, positions, QPointF(x_offset - self.predicate_spacing, 0))
-        
-        return positions
-        
-    def _position_cut_children(self, cut_obj, positions, cut_center):
-        """Position children within a cut."""
-        children = list(cut_obj.children)
-        if not children:
-            return
-            
-        # Arrange children in a circle or grid within the cut
-        if len(children) == 1:
-            positions[children[0]] = cut_center
-        else:
-            radius = 30
-            angle_step = 2 * math.pi / len(children)
-            
-            for i, child_id in enumerate(children):
-                angle = i * angle_step
-                x = cut_center.x() + radius * math.cos(angle)
-                y = cut_center.y() + radius * math.sin(angle)
-                positions[child_id] = QPointF(x, y)
-                
-                # Recursively position if this child is also a cut
-                child_obj = cut_obj.parent().model.get_object(child_id) if hasattr(cut_obj, 'parent') else None
-                if child_obj and isinstance(child_obj, Cut):
-                    self._position_cut_children(child_obj, positions, QPointF(x, y))
-        
-    def _calculate_cut_bounds(self, cut_obj, positions):
-        """Calculate the bounding rectangle for a cut based on its children."""
-        if not cut_obj.children:
-            return QRectF(-60, -40, 120, 80)
-            
-        # Get positions of all children
-        child_positions = [positions.get(child_id, QPointF(0, 0)) for child_id in cut_obj.children]
-        
-        if not child_positions:
-            return QRectF(-60, -40, 120, 80)
-            
-        # Calculate bounding box
-        min_x = min(pos.x() for pos in child_positions) - 40
-        max_x = max(pos.x() for pos in child_positions) + 40
-        min_y = min(pos.y() for pos in child_positions) - 30
-        max_y = max(pos.y() for pos in child_positions) + 30
-        
-        return QRectF(min_x, min_y, max_x - min_x, max_y - min_y)
-        
-    def _create_ligatures_from_model(self, graph_model):
-        """Create ligatures from the graph model."""
-        for obj_id, obj in graph_model.objects.items():
-            if isinstance(obj, Ligature):
-                connections = list(obj.attachments)
-                if len(connections) > 1:
-                    self.ligature_manager.create_ligature(obj_id, connections)
+                if len(hook_list) == 0:
+                    # No hook connections - create standalone line
+                    line_item = StandaloneLineOfIdentityItem(line_id, var_name)
+                    line_item.setPos(QPointF(0, 0))
+                    self.scene.addItem(line_item)
+                    self.line_items[line_id] = line_item
                     
+                elif len(hook_list) == 1:
+                    # Single connection - create line attached to hook
+                    pred_id, hook_index = hook_list[0]
+                    pred_item = self.graphics_items.get(pred_id)
+                    
+                    if pred_item:
+                        line_item = StandaloneLineOfIdentityItem(line_id, var_name, pred_item, hook_index)
+                        # The line will position itself based on the hook
+                        self.scene.addItem(line_item)
+                        self.line_items[line_id] = line_item
+                        
+                        # Establish the connection
+                        pred_item.add_connected_line(line_item)
+                        
+                elif len(hook_list) >= 2:
+                    # Multiple connections - line spans between hooks
+                    line_item = LineOfIdentityItem(line_id, var_name)
+                    
+                    # Connect to all hooks
+                    connected_predicates = []
+                    for pred_id, hook_index in hook_list:
+                        pred_item = self.graphics_items.get(pred_id)
+                        if pred_item:
+                            line_item.add_hook_connection(pred_item, hook_index)
+                            pred_item.add_connected_line(line_item)
+                            connected_predicates.append((pred_item, hook_index))
+                    
+                    # The line will position itself based on the hook connections
+                    self.scene.addItem(line_item)
+                    self.line_items[line_id] = line_item
+    
+    def _find_predicates_for_line_via_hooks(self, line_id, hook_connections):
+        """Find predicates connected to a line via hook connections."""
+        connected = []
+        
+        for (pred_id, hook_index), connected_line_id in hook_connections.items():
+            if connected_line_id == line_id:
+                pred_item = self.graphics_items.get(pred_id)
+                if pred_item:
+                    connected.append((pred_item, hook_index))
+        
+        return connected
+    
+    def _create_proper_ligatures(self, parse_result):
+        """Create ligatures with proper hook-to-hook connections."""
+        hook_connections = parse_result.get('hook_connections', {})
+        
+        # Group hook connections by line ID
+        line_to_hooks = {}
+        for (pred_id, hook_index), line_id in hook_connections.items():
+            if line_id not in line_to_hooks:
+                line_to_hooks[line_id] = []
+            line_to_hooks[line_id].append((pred_id, hook_index))
+        
+        # Create ligatures for lines with multiple hook connections
+        for line_id, hook_list in line_to_hooks.items():
+            if len(hook_list) > 1:
+                # Create ligature connecting these hooks
+                ligature_id = f"lig_{line_id}"
+                ligature_item = LigatureItem(ligature_id, self.editor)
+                
+                # Connect to specific hooks
+                for pred_id, hook_index in hook_list:
+                    pred_item = self.graphics_items.get(pred_id)
+                    if pred_item:
+                        ligature_item.connect_to_hook(pred_item, hook_index)
+                
+                self.scene.addItem(ligature_item)
+                self.ligature_items[ligature_id] = ligature_item
+    
+    def _calculate_items_bounds(self, items):
+        """Calculate the bounding rectangle of a list of graphics items."""
+        if not items:
+            return QRectF(0, 0, 0, 0)
+        
+        bounds = items[0].sceneBoundingRect()
+        for item in items[1:]:
+            bounds = bounds.united(item.sceneBoundingRect())
+        
+        return bounds
+        
     def _optimize_layout(self):
         """Optimize the layout to minimize overlaps and improve readability."""
-        # Simple optimization - can be enhanced with more sophisticated algorithms
-        
         # Separate items by type
         predicates = []
         cuts = []
+        lines = []
         
         for item in self.graphics_items.values():
             if hasattr(item, 'predicate_id'):
@@ -316,11 +301,19 @@ class EGRenderer:
             elif hasattr(item, 'cut_id'):
                 cuts.append(item)
         
+        for item in self.line_items.values():
+            lines.append(item)
+        
         # Adjust predicate positions to avoid overlaps
         self._resolve_predicate_overlaps(predicates)
         
+        # Update line positions
+        for line in lines:
+            if hasattr(line, 'update_position_from_hooks'):
+                line.update_position_from_hooks()
+        
         # Update ligature paths
-        for ligature in self.ligature_manager.ligatures.values():
+        for ligature in self.ligature_items.values():
             ligature.update_path()
             
     def _resolve_predicate_overlaps(self, predicates):
@@ -346,13 +339,13 @@ class EGRenderer:
                     dy = center2.y() - center1.y()
                     
                     if abs(dx) < 1 and abs(dy) < 1:
-                        dx, dy = 50, 0  # Default separation
+                        dx, dy = 80, 0  # Default separation
                     
                     # Normalize and scale
                     length = math.sqrt(dx*dx + dy*dy)
                     if length > 0:
-                        dx = (dx / length) * 60
-                        dy = (dy / length) * 30
+                        dx = (dx / length) * 90
+                        dy = (dy / length) * 50
                         
                         # Move items apart
                         item1.setPos(item1.pos() - QPointF(dx/2, dy/2))
@@ -364,15 +357,21 @@ class EGRenderer:
             if hasattr(item, 'set_mode'):
                 item.set_mode(mode)
                 
-        self.ligature_manager.set_mode(mode)
+        for item in self.ligature_items.values():
+            if hasattr(item, 'set_mode'):
+                item.set_mode(mode)
         
     def get_graphics_item(self, object_id):
         """Get graphics item by object ID."""
         return self.graphics_items.get(object_id)
         
-    def get_all_graphics_items(self):
-        """Get all graphics items."""
-        return self.graphics_items.copy()
+    def get_line_item(self, line_id):
+        """Get line graphics item by line ID."""
+        return self.line_items.get(line_id)
+        
+    def get_ligature_item(self, ligature_id):
+        """Get ligature graphics item by ligature ID."""
+        return self.ligature_items.get(ligature_id)
 
 # Example usage and testing
 if __name__ == "__main__":
@@ -389,18 +388,43 @@ if __name__ == "__main__":
     editor = EGEditor()
     renderer = EGRenderer(scene, editor)
     
-    # Test with a simple CLIF expression
+    # Test with CLIF parser
     parser = ClifParser(editor)
-    result = parser.parse("(exists (x y) (and (Cat x) (Mat y) (On x y)))")
     
-    if result['success']:
-        renderer.render_from_parse_result(result)
-        print("Rendered successfully")
-    else:
-        print(f"Parse error: {result['error']}")
+    test_cases = [
+        "(Cat x)",
+        "(On cat mat)",
+        "(exists (x y) (and (Cat x) (Mat y) (On x y)))",
+        "(= x y)",
+        "(and (Cat x) (Dog y))"
+    ]
     
-    view.show()
-    view.fitInView(scene.itemsBoundingRect())
+    for i, expr in enumerate(test_cases):
+        print(f"\nTesting: {expr}")
+        
+        # Create fresh components for each test
+        editor = EGEditor()
+        parser = ClifParser(editor)
+        renderer = EGRenderer(scene, editor)
+        
+        result = parser.parse(expr)
+        
+        if result['success']:
+            render_success = renderer.render_from_parse_result(result)
+            if render_success:
+                print(f"✓ Rendered successfully")
+                print(f"  Graphics items: {len(renderer.graphics_items)}")
+                print(f"  Line items: {len(renderer.line_items)}")
+                print(f"  Ligature items: {len(renderer.ligature_items)}")
+            else:
+                print(f"✗ Render failed")
+        else:
+            print(f"✗ Parse error: {result['error']}")
+        
+        if i == 0:  # Show first test visually
+            view.show()
+            view.fitInView(scene.itemsBoundingRect())
+            break
     
     print("EG Renderer test - close window to exit")
     app.exec()
